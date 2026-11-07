@@ -1,0 +1,41 @@
+{
+  "config": {
+    "flow_title": "{name}",
+    "step": {
+      "user": {
+        "title": "Xiaomi Smart Jump Rope",
+        "description": "Choose the rope. It only shows up while awake: jump or press its button.",
+        "data": {
+          "address": "Rope"
+        }
+      },
+      "credentials": {
+        "title": "Pairing credentials",
+        "description": "Enter the credentials of the existing Mi Fitness pairing of {name} (see the README for how to get them).",
+        "data": {
+          "app_device_id": "App device ID (32 hex characters)",
+          "token": "Token (32 hex characters)"
+        }
+      }
+    },
+    "error": {
+      "invalid_app_device_id": "The app device ID must be 32 hex characters",
+      "invalid_token": "The token must be 32 hex characters"
+    },
+    "abort": {
+      "already_configured": "This rope is already configured",
+      "no_devices_found": "No jump rope found. Wake the rope (jump or press its button) and try again."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "jumps": { "name": "Jumps" },
+      "calories": { "name": "Calories" },
+      "duration": { "name": "Duration" },
+      "last_read": { "name": "Last read" }
+    },
+    "binary_sensor": {
+      "workout_active": { "name": "Workout active" }
+    }
+  }
+}

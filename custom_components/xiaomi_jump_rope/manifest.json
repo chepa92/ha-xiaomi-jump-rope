@@ -1,0 +1,19 @@
+{
+  "domain": "xiaomi_jump_rope",
+  "name": "Xiaomi Smart Jump Rope",
+  "bluetooth": [
+    {
+      "local_name": "Mijia Smart Jump Rope*",
+      "connectable": true
+    }
+  ],
+  "codeowners": ["@chepa92"],
+  "config_flow": true,
+  "dependencies": ["bluetooth_adapters"],
+  "documentation": "https://github.com/chepa92/ha-xiaomi-jump-rope",
+  "integration_type": "device",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/chepa92/ha-xiaomi-jump-rope/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}
