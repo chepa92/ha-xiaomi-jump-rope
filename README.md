@@ -11,11 +11,37 @@ without the Mi Fitness app and without any cloud.
 
 | Entity | Meaning |
 |---|---|
-| Jumps | jump count of the current/last session |
-| Calories | kcal of the current/last session |
-| Duration | seconds of the current/last session |
-| Workout active | on while the jump count changed in the last 3 minutes |
+| Jumps / Calories / Duration | counters of the current (or last) session |
+| Jumps today / Calories today / Duration today / Sessions today | totals of finished sessions today plus the running one (reset at midnight, survive restarts) |
+| Last session jumps | jumps of the last finished session (attributes via the event below) |
+| Workout active | on while a session is in progress |
 | Last read | when Home Assistant last got data from the rope (diagnostic) |
+
+## Sessions and the `xiaomi_jump_rope_session_completed` event
+
+The rope has no "workout finished" signal, so a session is considered **finished** when
+the jump count stops changing for **3 minutes** (or the rope restarts its counters).
+Sessions shorter than 5 jumps are ignored. A stale value left on the rope from before
+Home Assistant started is not treated as a session: a session starts when the count is
+seen **changing**.
+
+When a session finishes, one event is fired:
+
+```yaml
+event_type: xiaomi_jump_rope_session_completed
+data:
+  jumps: 120
+  calories: 14
+  duration: 305        # seconds
+  start_time: 1794085827   # unix time
+  end_time: 1794086132
+```
+
+### Sending sessions to Garmin Connect
+
+[ha-garmin-sync](https://github.com/chepa92/ha-garmin-sync) can turn each finished session into a
+Garmin **Jump Rope** activity (one per session, not one per jump): enable
+*Sync Jump Rope sessions to Garmin* in its options (needs a version with jump rope support).
 
 ## How it works
 

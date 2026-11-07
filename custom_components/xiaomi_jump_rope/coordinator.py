@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Any
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 
@@ -19,11 +20,12 @@ from homeassistant.components.bluetooth import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.storage import Store
+from homeassistant.util import dt as dt_util
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
     ACTIVE_INTERVAL,
-    ACTIVE_WINDOW,
     CONF_ADDRESS,
     CONF_APP_DEVICE_ID,
     CONF_TOKEN,
@@ -33,8 +35,12 @@ from .const import (
     TICK_INTERVAL,
 )
 from .protocol import RopeAuthError, RopeError, RopeStatus, read_status
+from .session import DayTotals, FinishedSession, SessionTracker
 
 _LOGGER = logging.getLogger(__name__)
+
+EVENT_SESSION_COMPLETED = f"{DOMAIN}_session_completed"
+STORE_VERSION = 1
 
 
 class JumpRopeCoordinator(DataUpdateCoordinator[RopeStatus | None]):
@@ -53,9 +59,24 @@ class JumpRopeCoordinator(DataUpdateCoordinator[RopeStatus | None]):
         self._busy = False
         self._last_attempt = 0.0
         self._failures = 0
-        self._last_change = 0.0
         self.last_read: datetime | None = None
         self.last_error: str | None = None
+        self.tracker = SessionTracker()
+        self.today = DayTotals()
+        self._store: Store[dict[str, Any]] = Store(
+            hass, STORE_VERSION, f"{DOMAIN}.{entry.entry_id}"
+        )
+
+    async def async_load(self) -> None:
+        """Restore today's totals (survives restarts)."""
+        self.today = DayTotals.from_dict(await self._store.async_load())
+        self.today.roll(dt_util.now().date().isoformat())
+
+    @property
+    def today_totals(self) -> DayTotals:
+        """Today's totals including the session in progress."""
+        self.today.roll(dt_util.now().date().isoformat())
+        return self.today
 
     @callback
     def async_start(self) -> Callable[[], None]:
@@ -79,9 +100,8 @@ class JumpRopeCoordinator(DataUpdateCoordinator[RopeStatus | None]):
 
     @property
     def is_active(self) -> bool:
-        if not self._last_change:
-            return False
-        return (time.monotonic() - self._last_change) < ACTIVE_WINDOW
+        """True while a workout session is in progress."""
+        return self.tracker.active
 
     @callback
     def _on_advertisement(
@@ -91,7 +111,10 @@ class JumpRopeCoordinator(DataUpdateCoordinator[RopeStatus | None]):
 
     @callback
     def _on_tick(self, _now: datetime) -> None:
-        """Periodic check: read if the rope is currently around."""
+        """Periodic check: close idle sessions, read if the rope is around."""
+        finished = self.tracker.check_timeout(time.monotonic(), int(time.time()))
+        if finished is not None:
+            self._complete(finished)
         if bluetooth.async_address_present(self.hass, self.address, connectable=True):
             self._maybe_read()
 
@@ -132,16 +155,38 @@ class JumpRopeCoordinator(DataUpdateCoordinator[RopeStatus | None]):
             self._failures = 0
             self.last_error = None
             self.last_read = datetime.now(timezone.utc)
-            previous = self.data
-            if (
-                previous is None
-                or status.jumps != previous.jumps
-                or status.calories != previous.calories
+            for finished in self.tracker.update(
+                status.jumps,
+                status.calories,
+                status.duration,
+                time.monotonic(),
+                int(time.time()),
             ):
-                self._last_change = time.monotonic()
+                self._complete(finished)
             self.async_set_updated_data(status)
         finally:
             self._busy = False
+
+    def _complete(self, finished: FinishedSession) -> None:
+        """A session ended: update totals, persist, fire the event."""
+        self.today.add(dt_util.now().date().isoformat(), finished)
+        self._store.async_delay_save(self.today.to_dict, 1)
+        _LOGGER.info(
+            "Jump session finished: %d jumps, %d kcal, %d s",
+            finished.jumps, finished.calories, finished.duration,
+        )
+        self.hass.bus.async_fire(
+            EVENT_SESSION_COMPLETED,
+            {
+                "address": self.address,
+                "jumps": finished.jumps,
+                "calories": finished.calories,
+                "duration": finished.duration,
+                "start_time": finished.start_time,
+                "end_time": finished.end_time,
+            },
+        )
+        self.async_update_listeners()
 
     def _fail(self, message: str) -> None:
         self._failures = min(self._failures + 1, 6)
