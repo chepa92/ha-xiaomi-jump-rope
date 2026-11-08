@@ -62,8 +62,10 @@ data:
 ### Sending sessions to Garmin Connect
 
 [ha-garmin-sync](https://github.com/chepa92/ha-garmin-sync) can turn each finished session into a
-Garmin **Jump Rope** activity (one per session, not one per jump): enable
-*Sync Jump Rope sessions to Garmin* in its options (needs a version with jump rope support).
+Garmin **Jump Rope** activity (one per workout, not one per jump; start time, duration, calories and
+the jump count in the title): enable *Sync Jump Rope sessions to Garmin* in its options (needs
+ha-garmin-sync **1.3.0 or newer**). To upload workouts that are already stored, press
+**Resend stored workouts** once; already-uploaded workouts are skipped.
 
 ## How it works
 
