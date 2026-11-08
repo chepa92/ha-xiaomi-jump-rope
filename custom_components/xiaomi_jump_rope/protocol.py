@@ -672,8 +672,12 @@ async def read_history(
             for rid in _split_ids(payload):
                 if rid not in ids:
                     ids.append(rid)
-    fresh = [rid for rid in ids if rid.hex() not in known][:max_new]
-    _LOGGER.debug("rope lists %d records, %d new", len(ids), len(fresh))
+    # Everything the rope still lists is requested: records we already hold are handed to
+    # ``on_record`` as well so they get confirmed (freed) and can never block the queue.
+    fresh = ids[:max_new]
+    _LOGGER.debug(
+        "rope lists %d records (%d already stored)", len(ids), sum(r.hex() in known for r in ids)
+    )
 
     records: list[RawRecord] = []
     for rid in fresh:

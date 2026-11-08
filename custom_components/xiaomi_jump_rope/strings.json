@@ -90,6 +90,12 @@
     "button": {
       "connect_now": {
         "name": "Connect now"
+      },
+      "resend_workouts": {
+        "name": "Resend stored workouts"
+      },
+      "clear_journal": {
+        "name": "Clear journal"
       }
     }
   }

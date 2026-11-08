@@ -17,15 +17,37 @@ without the Mi Fitness app and without any cloud.
 | Workout active | on while a session is in progress |
 | Last read | when Home Assistant last got data from the rope (diagnostic) |
 
-## Sessions and the `xiaomi_jump_rope_session_completed` event
+## Buttons
 
-The rope has no "workout finished" signal, so a session is considered **finished** when
-the jump count stops changing for **3 minutes** (or the rope restarts its counters).
-Sessions shorter than 5 jumps are ignored. A stale value left on the rope from before
-Home Assistant started is not treated as a session: a session starts when the count is
-seen **changing**.
+| Button | What it does |
+|---|---|
+| **Connect now** | Connects immediately, reads the live counters and downloads stored workouts. The rope must be awake. |
+| **Resend stored workouts** | Fires the session event again for every stored workout. Garmin Sync skips ones it already uploaded, so this is safe to press. |
+| **Clear journal** | Clears the journal and the stored records (a `.bak` copy of each file is kept). Garmin Sync is not affected. |
 
-When a session finishes, one event is fired:
+## Files (in the Home Assistant config folder)
+
+* `xiaomi_jump_rope_journal_<MAC>.json`: one entry per finished workout (date, time, start/end, jumps, calories, duration), no duplicates.
+* `xiaomi_jump_rope_records_<MAC>.json`: every record downloaded from the rope (decoded fields plus the raw bytes).
+
+## Stored workouts
+
+The rope keeps up to 90 finished workouts. Home Assistant downloads them when it connects
+(at setup, after a workout, every 30 minutes, and on **Connect now**). Each record is
+**saved to disk first and only then confirmed**, which frees it on the rope; the rope will not
+send the next record before that. A workout that is already stored (same start time) is never
+saved or announced twice.
+
+Decoded per workout: start, end, elapsed time (pauses included), **jumps**, **calories**,
+average and maximum frequency (jumps/min).
+
+## The `xiaomi_jump_rope_session_completed` event
+
+The **sensors** (jumps, calories, duration, today's totals, workout active) follow the live
+counters; a live session is considered finished when the jump count stops changing for
+3 minutes.
+
+The **event** is fired once per workout *stored on the rope*, so it carries exact numbers:
 
 ```yaml
 event_type: xiaomi_jump_rope_session_completed

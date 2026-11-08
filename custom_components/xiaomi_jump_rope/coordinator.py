@@ -105,7 +105,31 @@ class JumpRopeCoordinator(DataUpdateCoordinator[RopeStatus | None]):
         self.journal_entries = len(journal) if isinstance(journal, list) else 0
         records = await self.hass.async_add_executor_job(_read_json, self.records_path, {})
         self._records = records if isinstance(records, dict) else {}
+        for entry in self._records.values():  # decoder may have improved since saving
+            try:
+                entry["decoded"] = decode_record(bytes.fromhex(entry["raw_hex"]))
+            except (KeyError, ValueError):
+                pass
+        if self._drop_duplicate_summaries():
+            await self.hass.async_add_executor_job(_write_json, self.records_path, self._records)
         self.stored_records = len(self._records)
+        await self._async_journal_from_records()
+
+    def _drop_duplicate_summaries(self) -> bool:
+        """Keep one summary per workout start time (the earliest received)."""
+        seen: dict[int, str] = {}
+        drop: list[str] = []
+        for key, entry in sorted(self._records.items(), key=lambda kv: kv[1].get("received_at", "")):
+            dec = entry.get("decoded", {})
+            if dec.get("kind") != "summary" or "start_time" not in dec:
+                continue
+            if dec["start_time"] in seen:
+                drop.append(key)
+            else:
+                seen[dec["start_time"]] = key
+        for key in drop:
+            del self._records[key]
+        return bool(drop)
 
     @property
     def today_totals(self) -> DayTotals:
@@ -234,12 +258,26 @@ class JumpRopeCoordinator(DataUpdateCoordinator[RopeStatus | None]):
             self._busy = False
 
     async def _on_record(self, record: RawRecord) -> bool:
-        """Save a downloaded record to disk; True = safe to free it on the rope."""
+        """Save a downloaded record to disk; True = safe to free it on the rope.
+
+        A record that is already stored (same id, or another summary of the same workout)
+        is not saved or announced again, but it is still confirmed so the rope frees it.
+        """
         key = record.record_id.hex()
+        decoded = decode_record(record.data)
+        if key in self._records:
+            return True
+        if decoded.get("kind") == "summary" and any(
+            e.get("decoded", {}).get("start_time") == decoded.get("start_time")
+            for e in self._records.values()
+            if e.get("decoded", {}).get("kind") == "summary"
+        ):
+            _LOGGER.debug("Duplicate workout %s ignored", key)
+            return True
         entry = {
             "record_id": key,
             "received_at": dt_util.now().isoformat(timespec="seconds"),
-            "decoded": decode_record(record.data),
+            "decoded": decoded,
             "raw_hex": record.data.hex(),
         }
         self._records[key] = entry
@@ -250,13 +288,109 @@ class JumpRopeCoordinator(DataUpdateCoordinator[RopeStatus | None]):
             self._records.pop(key, None)
             return False
         self.stored_records = len(self._records)
+        await self._async_journal_from_records()
+        self._fire_session(entry["decoded"])
         self.async_update_listeners()
         return True
 
+    async def async_clear_journal(self) -> None:
+        """Clear the journal and the locally stored records (one .bak copy is kept).
+
+        Workouts already sent to Garmin are not affected (Garmin Sync keeps its own list).
+        """
+
+        def _clear() -> None:
+            for path in (self.journal_path, self.records_path):
+                if os.path.exists(path):
+                    os.replace(path, f"{path}.bak")
+
+        await self.hass.async_add_executor_job(_clear)
+        self._records = {}
+        self.stored_records = 0
+        self.journal_entries = 0
+        _LOGGER.info("Journal and stored records cleared (backups: *.json.bak)")
+        self.async_update_listeners()
+
     # ------------------------------------------------------------------ sessions
 
+    @staticmethod
+    def _session_of(decoded: dict) -> dict | None:
+        """A finished workout from a decoded summary record, or None."""
+        if decoded.get("kind") != "summary" or not decoded.get("jumps"):
+            return None
+        return {
+            "jumps": decoded["jumps"],
+            "calories": decoded.get("calories", 0),
+            "duration": decoded.get("elapsed_seconds", 0),
+            "start_time": decoded["start_time"],
+            "end_time": decoded["end_time"],
+        }
+
+    def _fire_session(self, decoded: dict) -> None:
+        """Fire the 'session completed' event for one stored workout (once per workout
+        and per Garmin Sync dedup key = start_time)."""
+        session = self._session_of(decoded)
+        if session is None:
+            return
+        _LOGGER.info(
+            "Stored workout: %d jumps, %d kcal, %d s (start %s)",
+            session["jumps"], session["calories"], session["duration"], session["start_time"],
+        )
+        self.hass.bus.async_fire(EVENT_SESSION_COMPLETED, {"address": self.address, **session})
+
+    async def async_resend_workouts(self) -> int:
+        """Fire the event again for every stored workout (Garmin Sync skips known ones)."""
+        sent = 0
+        for entry in sorted(
+            self._records.values(), key=lambda e: e["decoded"].get("start_time", 0)
+        ):
+            if self._session_of(entry["decoded"]):
+                self._fire_session(entry["decoded"])
+                sent += 1
+        return sent
+
+    async def _async_journal_from_records(self) -> None:
+        """Make sure every stored workout is in the journal file."""
+        sessions = [
+            s for s in (self._session_of(e["decoded"]) for e in self._records.values()) if s
+        ]
+        if not sessions:
+            return
+
+        def _sync() -> int:
+            journal = _read_json(self.journal_path, [])
+            if not isinstance(journal, list):
+                journal = []
+            have = {str(r.get("start_time")) for r in journal}
+            changed = False
+            for sess in sorted(sessions, key=lambda x: x["start_time"]):
+                if str(sess["start_time"]) in have:
+                    continue
+                start = datetime.fromtimestamp(sess["start_time"])
+                journal.append(
+                    {
+                        "training_date": start.strftime("%Y-%m-%d"),
+                        "training_time": start.strftime("%H:%M:%S"),
+                        "start_time": sess["start_time"],
+                        "end_time": sess["end_time"],
+                        "jumps": sess["jumps"],
+                        "calories": sess["calories"],
+                        "duration_sec": sess["duration"],
+                        "recorded_at": dt_util.now().isoformat(timespec="seconds"),
+                    }
+                )
+                changed = True
+            if changed:
+                _write_json(self.journal_path, journal)
+            return len(journal)
+
+        try:
+            self.journal_entries = await self.hass.async_add_executor_job(_sync)
+        except OSError as err:
+            _LOGGER.error("Could not write the journal: %s", err)
+
     def _complete(self, finished: FinishedSession) -> None:
-        """A session ended: update totals, persist, journal, fire the event."""
+        """A session ended (seen live): update totals; the stored record will follow."""
         self.today.add(dt_util.now().date().isoformat(), finished)
         self._store.async_delay_save(self.today.to_dict, 1)
         self._want_history = True  # the rope now holds a record of it
@@ -264,48 +398,7 @@ class JumpRopeCoordinator(DataUpdateCoordinator[RopeStatus | None]):
             "Jump session finished: %d jumps, %d kcal, %d s",
             finished.jumps, finished.calories, finished.duration,
         )
-        self.hass.async_create_task(self._async_journal(finished))
-        self.hass.bus.async_fire(
-            EVENT_SESSION_COMPLETED,
-            {
-                "address": self.address,
-                "jumps": finished.jumps,
-                "calories": finished.calories,
-                "duration": finished.duration,
-                "start_time": finished.start_time,
-                "end_time": finished.end_time,
-            },
-        )
         self.async_update_listeners()
-
-    async def _async_journal(self, finished: FinishedSession) -> None:
-        start = datetime.fromtimestamp(finished.start_time)
-        record = {
-            "training_date": start.strftime("%Y-%m-%d"),
-            "training_time": start.strftime("%H:%M:%S"),
-            "start_time": finished.start_time,
-            "end_time": finished.end_time,
-            "jumps": finished.jumps,
-            "calories": finished.calories,
-            "duration_sec": finished.duration,
-            "recorded_at": dt_util.now().isoformat(timespec="seconds"),
-        }
-
-        def _append() -> int:
-            journal = _read_json(self.journal_path, [])
-            if not isinstance(journal, list):
-                journal = []
-            if str(finished.start_time) not in {str(r.get("start_time")) for r in journal}:
-                journal.append(record)
-                _write_json(self.journal_path, journal)
-            return len(journal)
-
-        try:
-            self.journal_entries = await self.hass.async_add_executor_job(_append)
-        except OSError as err:
-            _LOGGER.error("Could not write the journal: %s", err)
-        else:
-            self.async_update_listeners()
 
     def _fail(self, message: str) -> None:
         self._failures = min(self._failures + 1, 6)
