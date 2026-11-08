@@ -9,14 +9,33 @@
           "address": "Rope"
         }
       },
+      "method": {
+        "title": "Connect the rope",
+        "description": "Pair the rope directly with Home Assistant (no phone needed), or reuse the credentials of an existing Mi Fitness pairing.",
+        "menu_options": {
+          "pair": "Pair now (press the rope's button)",
+          "credentials": "Enter existing credentials"
+        }
+      },
+      "pair_failed": {
+        "title": "Pairing failed",
+        "description": "The rope could not be paired: {error}\n\nWake the rope with a button press and try again.",
+        "menu_options": {
+          "pair": "Try again",
+          "credentials": "Enter existing credentials"
+        }
+      },
       "credentials": {
-        "title": "Pairing credentials",
-        "description": "Enter the credentials of the existing Mi Fitness pairing of {name} (see the README for how to get them).",
+        "title": "Existing pairing",
+        "description": "Enter the credentials of the existing Mi Fitness pairing of {name} (see the README).",
         "data": {
           "app_device_id": "App device ID (32 hex characters)",
           "token": "Token (32 hex characters)"
         }
       }
+    },
+    "progress": {
+      "pair": "Press the **Power button** on the end of the rope's handle **once, now**.\n\nWaiting up to a minute. If the rope reports being busy, this retries automatically (about 40 s)."
     },
     "error": {
       "invalid_app_device_id": "The app device ID must be 32 hex characters",

@@ -64,7 +64,7 @@ workout may be missed** if the rope falls asleep between reads.
 * Only one device can talk to the rope at a time. Close Mi Fitness on your phone (or turn its Bluetooth off) while you want Home Assistant to read.
 * **Do not open the rope in Mi Fitness during a workout you care about**: leaving training in the app resets the data on the rope.
 * The integration is read-only: it never changes or resets anything on the rope.
-* If you re-pair the rope in Mi Fitness, the token changes: update it here.
+* If the rope is re-paired in another app with the same app ID, the token changes: remove and re-add the rope here.
 
 ## Install (HACS)
 
@@ -72,15 +72,22 @@ workout may be missed** if the rope falls asleep between reads.
 2. Install **Xiaomi Smart Jump Rope**, restart Home Assistant.
 3. Wake the rope (jump or press its button). It is **auto-discovered** under **Settings → Devices & services**; click *Configure* and enter the two credentials below. (You can also use *Add integration* → *Xiaomi Smart Jump Rope* while the rope is awake.)
 
-## Credentials
+## Pairing
 
-The integration needs the credentials of the rope's existing Mi Fitness pairing:
+**No phone and no rooting needed.** When you add the integration, choose **Pair now**,
+then press the **Power button on the end of the rope's handle once** when Home Assistant
+asks. The integration pairs with the rope itself (as its own "app") and stores the
+credentials in the config entry.
 
-* **app device ID** (32 hex characters),
-* **token** (32 hex characters).
+* If the rope reports it is busy (an earlier attempt is still pending), the integration waits about 40 s and retries by itself.
+* Pairing as an additional app does **not** remove existing pairings in principle (the rope supports several users, one connected at a time), but this has not been verified with every phone/app combination.
+* Treat the stored credentials like a password: anyone holding them can talk to your rope.
 
-They are stored by the Mi Fitness app (the China-region build, package `com.mi.health`) in
-`/data/data/com.mi.health/databases/eco_local_device_db`. Reading it needs a **rooted** phone:
+### Reusing an existing Mi Fitness pairing (optional)
+
+Choose **Enter existing credentials** to reuse a pairing made by the Mi Fitness app
+(China build, `com.mi.health`). It keeps them in
+`/data/data/com.mi.health/databases/eco_local_device_db` (rooted phone needed):
 
 ```
 adb shell su -c "cp /data/data/com.mi.health/databases/eco_local_device_db /sdcard/"
@@ -88,9 +95,8 @@ adb pull /sdcard/eco_local_device_db
 python tools/extract_credentials.py eco_local_device_db
 ```
 
-Treat the token like a password: anyone with it can talk to your rope. Never post it publicly.
-
-Creating independent pairing (so no phone is needed at all) is not implemented yet.
+You can also pair from a computer with `python tools/pair.py` (needs `bleak`), which writes
+`credentials.json` (keep it private).
 
 ## Development
 

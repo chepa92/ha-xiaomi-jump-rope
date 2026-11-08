@@ -47,3 +47,20 @@ def test_protobuf_roundtrip():
 def test_hkdf_is_deterministic_64_bytes():
     out = protocol.hkdf("miwear-auth", b"k" * 16, b"s" * 32, 64)
     assert len(out) == 64 and out == protocol.hkdf("miwear-auth", b"k" * 16, b"s" * 32, 64)
+
+
+def test_ecdh_agreement_and_app_id():
+    a_priv, a_pub = protocol.new_keypair()
+    b_priv, b_pub = protocol.new_keypair()
+    assert len(a_pub) == 64
+    assert protocol.ecdh(a_priv, b_pub) == protocol.ecdh(b_priv, a_pub)
+    ident = protocol.make_app_device_id("aa:bb:cc:dd:ee:ff", "homeassistant")
+    assert len(ident) == 32 and ident == protocol.make_app_device_id("AA:BB:CC:DD:EE:FF", "homeassistant")
+
+
+def test_ccm_with_aad():
+    key, nonce = bytes(range(16)), bytes(range(12))
+    ct = protocol.ccm_encrypt(key, nonce, b"payload", b"bind-data")
+    import pytest
+    with pytest.raises(Exception):
+        protocol.ccm_decrypt(key, nonce, ct)  # wrong (missing) aad must fail

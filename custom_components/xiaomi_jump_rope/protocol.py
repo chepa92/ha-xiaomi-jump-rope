@@ -33,6 +33,7 @@ import time
 from dataclasses import dataclass
 
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.ciphers.aead import AESCCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -48,6 +49,12 @@ CHAR_EXTRA = (
 
 DTYPE_ENCRYPTED = 1
 DTYPE_PLAIN = 2
+CMD_BIND_INFO = 17
+CMD_BIND_HELLO = 18
+CMD_BIND_CONFIRM = 19
+CMD_BIND_RESULT = 25
+BIND_DATA_NONCE = bytes(range(0x10, 0x1C))
+BIND_USER_ID = "homeassistant"
 CMD_RECONNECT_HELLO = 26
 CMD_RECONNECT_CONFIRM = 27
 MSG_TYPE_FITNESS = 8
@@ -60,6 +67,10 @@ class RopeError(Exception):
 
 class RopeAuthError(RopeError):
     """The rope rejected / failed the authentication handshake."""
+
+
+class RopeBusyError(RopeAuthError):
+    """The rope still holds an earlier pairing attempt: wait ~45 s and retry."""
 
 
 class RopeTimeout(RopeError):
@@ -163,8 +174,29 @@ def hmac_sha256(key: bytes, msg: bytes) -> bytes:
     return hmac.new(key, msg, hashlib.sha256).digest()
 
 
-def ccm_encrypt(key: bytes, nonce: bytes, data: bytes) -> bytes:
-    return AESCCM(key, tag_length=4).encrypt(nonce, data, None)
+def ccm_encrypt(key: bytes, nonce: bytes, data: bytes, aad: bytes | None = None) -> bytes:
+    return AESCCM(key, tag_length=4).encrypt(nonce, data, aad)
+
+
+def new_keypair():
+    """Ephemeral secp256r1 key pair; returns (private_key, X||Y public bytes)."""
+    priv = ec.generate_private_key(ec.SECP256R1())
+    n = priv.public_key().public_numbers()
+    return priv, n.x.to_bytes(32, "big") + n.y.to_bytes(32, "big")
+
+
+def ecdh(priv, peer_xy: bytes) -> bytes:
+    nums = ec.EllipticCurvePublicNumbers(
+        int.from_bytes(peer_xy[:32], "big"),
+        int.from_bytes(peer_xy[32:64], "big"),
+        ec.SECP256R1(),
+    )
+    return priv.exchange(ec.ECDH(), nums.public_key())
+
+
+def make_app_device_id(address: str, user_id: str) -> str:
+    """The app's id for this rope: MD5(upper(mac) + userId), as Mi Fitness does."""
+    return hashlib.md5((address.upper() + user_id).encode()).hexdigest()
 
 
 def ccm_decrypt(key: bytes, nonce: bytes, data: bytes) -> bytes:
@@ -250,7 +282,7 @@ class Channel:
             _LOGGER.debug("version read failed: %s", err)
 
     async def start(self) -> None:
-        for char in (CHAR_NOTIFY, CHAR_WRITE, *CHAR_EXTRA):
+        for char in (CHAR_WRITE, CHAR_NOTIFY, *CHAR_EXTRA):
             try:
                 await self.client.start_notify(char, self._on_notify)
             except Exception as err:  # noqa: BLE001
@@ -265,8 +297,13 @@ class Channel:
             except Exception:  # noqa: BLE001
                 pass
 
-    async def _write(self, frame: bytes) -> None:
-        await self.client.write_gatt_char(CHAR_WRITE, frame, response=False)
+    async def _write(self, frame: bytes, ack: bool = False) -> None:
+        # The official app writes its own messages to 0x52 but ACKs for the rope's
+        # messages to 0x51 (the rope's notify characteristic).  ACKs sent to 0x52 are
+        # ignored by the rope, which then answers late or with errors.
+        await self.client.write_gatt_char(
+            CHAR_NOTIFY if ack else CHAR_WRITE, frame, response=False
+        )
 
     def _on_notify(self, _sender, data: bytearray) -> None:
         task = asyncio.get_running_loop().create_task(self._handle(bytes(data)))
@@ -285,16 +322,16 @@ class Channel:
             if len(inc[2]) >= inc[1]:
                 payload = b"".join(inc[2][i] for i in range(1, inc[1] + 1))
                 self._incoming = None
-                await self._write(struct.pack("<HBB", 0, 1, 0))
+                await self._write(struct.pack("<HBB", 0, 1, 0), ack=True)
                 await self.msgs.put((inc[0], payload))
             return
         kind = d[2]
         if kind == 0:
             dtype, count = d[3], struct.unpack_from("<H", d, 4)[0]
             self._incoming = [dtype, count, {}]
-            await self._write(struct.pack("<HBB", 0, 1, 1))
+            await self._write(struct.pack("<HBB", 0, 1, 1), ack=True)
         elif kind == 2:
-            await self._write(struct.pack("<HBB", 0, 3, 0))
+            await self._write(struct.pack("<HBB", 0, 3, 0), ack=True)
             await self.msgs.put((d[3], d[4:]))
         elif kind in (1, 3):
             await self.acks.put((kind, d[3]))
@@ -396,5 +433,102 @@ async def read_status(client, app_device_id: str, token: bytes, timeout: float =
                 return status
             if time.monotonic() > deadline:
                 raise RopeTimeout("no status push received")
+    finally:
+        await ch.stop()
+
+
+# --------------------------------------------------------------------------- pairing
+
+
+@dataclass
+class BindResult:
+    """Credentials created by a fresh pairing."""
+
+    app_device_id: str
+    token: bytes
+
+
+async def bind(
+    client, address: str, on_press_needed=None, press_timeout: float = 60.0
+) -> BindResult:
+    """Pair with the rope as a new app (the rope shows no prompt: press its Power
+    button once when ``on_press_needed`` is called).  Needs no phone.
+
+    Raises RopeAuthError when the rope refuses and RopeTimeout when the button was
+    not pressed in time.
+    """
+    ch = Channel(client)
+    await ch.read_version()
+    await ch.start()
+    try:
+        app_device_id = make_app_device_id(address, BIND_USER_ID)
+
+        # 1. bind info (verify mode / button confirmation)
+        await ch.send(DTYPE_PLAIN, make_packet(1, CMD_BIND_INFO, f_bytes(11, f_varint(1, 0))), 15)
+        _d, payload = await ch.recv(15)
+        _t, _i, acct = parse_packet(payload)
+        if acct is None or pb_get(acct, 12) is None:
+            err = pb_get(acct, 3) if acct else None
+            raise RopeAuthError(f"rope does not offer pairing (error {err})")
+
+        # 2. hello with our ephemeral key
+        priv, pub = new_keypair()
+        if on_press_needed is not None:
+            on_press_needed()  # the app shows its "press the button" dialog right here
+        await ch.send(
+            DTYPE_PLAIN,
+            make_packet(1, CMD_BIND_HELLO, f_bytes(17, f_str(1, app_device_id) + f_bytes(2, pub))),
+            15,
+        )
+        _d, payload = await ch.recv(press_timeout)
+        _t, _i, acct = parse_packet(payload)
+        err = pb_get(acct, 3) if acct else None
+        if err == 6:
+            raise RopeBusyError("the rope is still busy with an earlier pairing attempt")
+        if err is not None:
+            raise RopeAuthError(f"rope rejected the pairing hello (error {err})")
+        x40 = pb_get(acct, 18) if acct else None
+        if x40 is None:
+            raise RopeAuthError("unexpected reply to pairing hello")
+        f = parse_pb(x40)
+        dev_pub, dev_rand, dev_sign = pb_get(f, 1), pb_get(f, 2), pb_get(f, 3)
+        shared = ecdh(priv, dev_pub)
+        if not hmac.compare_digest(hmac_sha256(shared, dev_rand), dev_sign):
+            raise RopeAuthError("rope signature mismatch during pairing")
+
+        # 3. confirm: the rope waits for a press of its Power button
+        app_rand = os.urandom(16)
+        okm = hkdf("miwear-bind", shared, app_rand + dev_rand, 64)
+        keys = SessionKeys(okm[0:16], okm[16:32], okm[32:36], okm[36:40])
+        token = okm[40:56]
+        confirm = make_packet(
+            1,
+            CMD_BIND_CONFIRM,
+            f_bytes(19, f_bytes(1, app_rand) + f_bytes(2, hmac_sha256(shared, app_rand))),
+        )
+        await ch.send(DTYPE_PLAIN, confirm, 15)
+        _d, payload = await ch.recv(press_timeout)
+        _t, _i, acct = parse_packet(payload)
+        err = pb_get(acct, 3) if acct else None
+        if err is not None:
+            raise RopeAuthError(
+                "pairing was cancelled on the rope" if err == 6 else f"pairing refused (error {err})"
+            )
+        res = pb_get(acct, 20) if acct else None
+        if res is None or not pb_get(parse_pb(res), 1):
+            raise RopeAuthError("the rope did not confirm the pairing")
+
+        # 4. bind result: AES-CCM(appKey, fixed nonce, {userId, deviceInfo}, aad)
+        info = f_varint(1, 0) + f_float(2, 34.0) + f_str(3, "HomeAssistant")
+        enc = ccm_encrypt(
+            keys.app_key, BIND_DATA_NONCE, f_str(1, BIND_USER_ID) + f_bytes(2, info), b"bind-data"
+        )
+        await ch.send(DTYPE_PLAIN, make_packet(1, CMD_BIND_RESULT, f_bytes(29, f_bytes(1, enc))), 15)
+        _d, payload = await ch.recv(20)
+        _t, _i, acct = parse_packet(payload)
+        err = pb_get(acct, 3) if acct else None
+        if err:
+            raise RopeAuthError(f"rope rejected the pairing result (error {err})")
+        return BindResult(app_device_id=app_device_id, token=token)
     finally:
         await ch.stop()
