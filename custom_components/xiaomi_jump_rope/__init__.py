@@ -7,7 +7,7 @@ from homeassistant.core import HomeAssistant
 
 from .coordinator import JumpRopeCoordinator
 
-PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR]
+PLATFORMS = [Platform.SENSOR, Platform.BINARY_SENSOR, Platform.BUTTON]
 
 type JumpRopeConfigEntry = ConfigEntry[JumpRopeCoordinator]
 

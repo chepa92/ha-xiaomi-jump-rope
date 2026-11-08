@@ -91,6 +91,22 @@ SENSORS: tuple[JumpRopeSensorDescription, ...] = (
         value_fn=lambda c, s: c.today.last.get("jumps"),
     ),
     JumpRopeSensorDescription(
+        key="stored_workouts",
+        translation_key="stored_workouts",
+        icon="mdi:database-arrow-down",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.TOTAL,
+        value_fn=lambda c, s: c.stored_records,
+    ),
+    JumpRopeSensorDescription(
+        key="journal_entries",
+        translation_key="journal_entries",
+        icon="mdi:notebook",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.TOTAL,
+        value_fn=lambda c, s: c.journal_entries,
+    ),
+    JumpRopeSensorDescription(
         key="last_read",
         translation_key="last_read",
         device_class=SensorDeviceClass.TIMESTAMP,

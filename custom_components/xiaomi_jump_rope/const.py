@@ -13,4 +13,5 @@ DEVICE_NAME_PREFIX = "Mijia Smart Jump Rope"
 ACTIVE_INTERVAL = 20  # seconds between reads during a workout
 IDLE_INTERVAL = 60  # seconds between reads when nothing changes
 TICK_INTERVAL = 20  # seconds between "is the rope around?" checks
+HISTORY_INTERVAL = 1800  # seconds between checks for stored workouts when nothing new happened
 MAX_BACKOFF = 300  # seconds, cap for retry back-off after failures

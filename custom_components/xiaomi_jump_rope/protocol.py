@@ -42,10 +42,8 @@ _LOGGER = logging.getLogger(__name__)
 CHAR_VERSION = "00000050-0000-1000-8000-00805f9b34fb"
 CHAR_NOTIFY = "00000051-0000-1000-8000-00805f9b34fb"
 CHAR_WRITE = "00000052-0000-1000-8000-00805f9b34fb"
-CHAR_EXTRA = (
-    "00000053-0000-1000-8000-00805f9b34fb",
-    "00000055-0000-1000-8000-00805f9b34fb",
-)
+CHAR_DATA = "00000053-0000-1000-8000-00805f9b34fb"  # bulk records (fitness data)
+CHAR_EXTRA = ("00000055-0000-1000-8000-00805f9b34fb",)
 
 DTYPE_ENCRYPTED = 1
 DTYPE_PLAIN = 2
@@ -263,7 +261,9 @@ class Channel:
         self.client = client
         self.acks: asyncio.Queue = asyncio.Queue()
         self.msgs: asyncio.Queue = asyncio.Queue()
+        self.data_msgs: asyncio.Queue = asyncio.Queue()
         self._incoming: list | None = None
+        self._data_incoming: list | None = None
         self._tasks: set[asyncio.Task] = set()
 
     @property
@@ -282,16 +282,22 @@ class Channel:
             _LOGGER.debug("version read failed: %s", err)
 
     async def start(self) -> None:
-        for char in (CHAR_WRITE, CHAR_NOTIFY, *CHAR_EXTRA):
+        # Same order as the official app: 0x52, 0x51, 0x53 (bulk data), 0x55.
+        for char, handler in (
+            (CHAR_WRITE, self._on_notify),
+            (CHAR_NOTIFY, self._on_notify),
+            (CHAR_DATA, self._on_data_notify),
+            *((c, lambda _s, _d: None) for c in CHAR_EXTRA),
+        ):
             try:
-                await self.client.start_notify(char, self._on_notify)
+                await self.client.start_notify(char, handler)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.debug("no notify on %s: %s", char[:8], err)
 
     async def stop(self) -> None:
         for task in list(self._tasks):
             task.cancel()
-        for char in (CHAR_NOTIFY, CHAR_WRITE, *CHAR_EXTRA):
+        for char in (CHAR_NOTIFY, CHAR_WRITE, CHAR_DATA, *CHAR_EXTRA):
             try:
                 await self.client.stop_notify(char)
             except Exception:  # noqa: BLE001
@@ -335,6 +341,38 @@ class Channel:
             await self.msgs.put((d[3], d[4:]))
         elif kind in (1, 3):
             await self.acks.put((kind, d[3]))
+
+    def _on_data_notify(self, _sender, data: bytearray) -> None:
+        task = asyncio.get_running_loop().create_task(self._handle_data(bytes(data)))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _write_data(self, frame: bytes) -> None:
+        await self.client.write_gatt_char(CHAR_DATA, frame, response=False)
+
+    async def _handle_data(self, d: bytes) -> None:
+        """Bulk data channel: same framing, ACKs go back on the same characteristic."""
+        if len(d) < 3:
+            return
+        seq = struct.unpack_from("<H", d, 0)[0]
+        if seq != 0:
+            inc = self._data_incoming
+            if inc is None:
+                return
+            inc[2][seq] = d[2:]
+            if len(inc[2]) >= inc[1]:
+                payload = b"".join(inc[2][i] for i in range(1, inc[1] + 1))
+                self._data_incoming = None
+                await self._write_data(struct.pack("<HBB", 0, 1, 0))
+                await self.data_msgs.put((inc[0], payload))
+            return
+        kind = d[2]
+        if kind == 0:
+            self._data_incoming = [d[3], struct.unpack_from("<H", d, 4)[0], {}]
+            await self._write_data(struct.pack("<HBB", 0, 1, 1))
+        elif kind == 2:
+            await self._write_data(struct.pack("<HBB", 0, 3, 0))
+            await self.data_msgs.put((d[3], d[4:]))
 
     async def send(self, dtype: int, payload: bytes, timeout: float = 12.0) -> None:
         """Send one message (single-frame only; all handshake messages fit)."""
@@ -530,5 +568,176 @@ async def bind(
         if err:
             raise RopeAuthError(f"rope rejected the pairing result (error {err})")
         return BindResult(app_device_id=app_device_id, token=token)
+    finally:
+        await ch.stop()
+
+
+# --------------------------------------------------------------------------- history
+
+
+class Session:
+    """Encrypted request/response layer after authentication."""
+
+    def __init__(self, ch: Channel, keys: SessionKeys) -> None:
+        self.ch = ch
+        self.keys = keys
+        self._counter = 0
+
+    def _encrypt(self, plain: bytes) -> bytes:
+        self._counter = (self._counter + 1) & 0xFFFFFFFF
+        lo, hi = self._counter & 0xFFFF, self._counter >> 16
+        nonce = self.keys.app_iv + b"\x00" * 4 + struct.pack("<HH", lo, hi)
+        return struct.pack("<H", lo) + ccm_encrypt(self.keys.app_key, nonce, plain)
+
+    async def send(self, plain: bytes) -> None:
+        await self.ch.send(DTYPE_ENCRYPTED, self._encrypt(plain), 10)
+
+    async def request(self, mtype: int, mid: int, payload: bytes | None = None, *, field: int = 10) -> None:
+        msg = f_varint(1, mtype) + f_varint(2, mid)
+        if payload is not None:
+            msg += f_bytes(field, payload)
+        await self.send(msg)
+
+    async def pump(self, seconds: float) -> list[tuple[int, int, bytes | None]]:
+        """Collect (type, id, payload) of everything the rope sends for a while."""
+        out: list[tuple[int, int, bytes | None]] = []
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            try:
+                dtype, wire = await asyncio.wait_for(self.ch.msgs.get(), max(0.05, end - time.monotonic()))
+            except asyncio.TimeoutError:
+                break
+            if dtype != DTYPE_ENCRYPTED:
+                continue
+            try:
+                top = parse_pb(self.keys.decrypt(wire))
+            except Exception:  # noqa: BLE001
+                continue
+            out.append((pb_get(top, 1), pb_get(top, 2), pb_get(top, 10)))
+        return out
+
+
+@dataclass
+class RawRecord:
+    """One stored workout record as sent by the rope (decrypted, not yet decoded)."""
+
+    record_id: bytes  # 7 bytes: start time (u32 LE) + 3 bytes
+    data: bytes
+
+
+def _split_ids(payload: bytes | None) -> list[bytes]:
+    if not payload:
+        return []
+    try:
+        raw = pb_get(parse_pb(payload), 2)
+    except (ValueError, IndexError):
+        return []
+    if not raw or len(raw) % 7:
+        return []
+    return [raw[i : i + 7] for i in range(0, len(raw), 7)]
+
+
+async def read_history(
+    ch: Channel,
+    keys: SessionKeys,
+    known: set[str],
+    on_record=None,
+    max_new: int = 40,
+) -> list[RawRecord]:
+    """Download stored workout records whose ids are not in ``known`` (hex).
+
+    Records are requested one by one.  ``on_record(record)`` (async, optional) is
+    awaited for each downloaded record; only if it returns True the record is
+    *confirmed* to the rope, which frees it on the rope.  Without a callback nothing
+    is ever confirmed (read-only).
+    """
+    sess = Session(ch, keys)
+    now = int(time.time())
+    v = f_varint
+    # The official app's opening sequence (the rope also gets its clock set here).
+    await sess.send(v(1, 33) + v(2, 0) + f_bytes(31, f_bytes(1, v(1, now))))
+    await sess.pump(0.8)
+    await sess.send(v(1, 33) + v(2, 5) + f_bytes(31, bytes.fromhex("32090a0012001a00220138")))
+    await sess.pump(0.8)
+    await sess.request(MSG_TYPE_FITNESS, 6)  # offline report list
+    await sess.pump(1.2)
+    await sess.request(MSG_TYPE_FITNESS, 1, bytes.fromhex("2a020800"))  # today
+    replies = await sess.pump(1.5)
+    await sess.request(MSG_TYPE_FITNESS, 2)  # history
+    replies += await sess.pump(1.5)
+
+    ids: list[bytes] = []
+    for _t, mid, payload in replies:
+        if mid in (1, 2):
+            for rid in _split_ids(payload):
+                if rid not in ids:
+                    ids.append(rid)
+    fresh = [rid for rid in ids if rid.hex() not in known][:max_new]
+    _LOGGER.debug("rope lists %d records, %d new", len(ids), len(fresh))
+
+    records: list[RawRecord] = []
+    for rid in fresh:
+        await sess.request(MSG_TYPE_FITNESS, 4, f_bytes(3, rid))
+        got: RawRecord | None = None
+        waited = 0.0
+        while waited < 10.0 and got is None:
+            try:
+                _dtype, wire = await asyncio.wait_for(ch.data_msgs.get(), 1.0)
+            except asyncio.TimeoutError:
+                waited += 1.0
+                await sess.pump(0.01)
+                continue
+            try:
+                plain = keys.decrypt(wire)
+            except Exception:  # noqa: BLE001
+                continue
+            if len(plain) >= 11:
+                got = RawRecord(record_id=plain[4:11], data=plain)
+        if got is None:
+            _LOGGER.debug("no data for record %s", rid.hex())
+            continue
+        records.append(got)
+        if on_record is not None and await on_record(got):
+            await sess.request(MSG_TYPE_FITNESS, 5, f_bytes(3, rid))
+            await sess.pump(1.0)
+    return records
+
+
+async def read_session(
+    client,
+    app_device_id: str,
+    token: bytes,
+    *,
+    want_history: bool = False,
+    known_ids: set[str] | None = None,
+    on_record=None,
+    timeout: float = 15.0,
+) -> tuple[RopeStatus, list[RawRecord]]:
+    """Authenticate, read the live status and optionally the stored history."""
+    ch = Channel(client)
+    await ch.read_version()
+    await ch.start()
+    try:
+        keys, pending = await authenticate(ch, app_device_id, token)
+        status: RopeStatus | None = None
+        deadline = time.monotonic() + timeout
+        while status is None:
+            if pending is not None:
+                dtype, wire, pending = DTYPE_ENCRYPTED, pending, None
+            else:
+                dtype, wire = await ch.recv(max(0.1, deadline - time.monotonic()))
+            if dtype != DTYPE_ENCRYPTED:
+                continue
+            try:
+                status = parse_status_push(keys.decrypt(wire))
+            except Exception:  # noqa: BLE001
+                continue
+        records: list[RawRecord] = []
+        if want_history:
+            try:
+                records = await read_history(ch, keys, known_ids or set(), on_record)
+            except (RopeError, OSError) as err:
+                _LOGGER.debug("history read failed: %s", err)
+        return status, records
     finally:
         await ch.stop()

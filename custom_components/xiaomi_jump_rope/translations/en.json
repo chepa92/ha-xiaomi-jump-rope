@@ -48,18 +48,49 @@
   },
   "entity": {
     "sensor": {
-      "jumps": { "name": "Jumps" },
-      "calories": { "name": "Calories" },
-      "duration": { "name": "Duration" },
-      "today_jumps": { "name": "Jumps today" },
-      "today_calories": { "name": "Calories today" },
-      "today_duration": { "name": "Duration today" },
-      "today_sessions": { "name": "Sessions today" },
-      "last_session_jumps": { "name": "Last session jumps" },
-      "last_read": { "name": "Last read" }
+      "jumps": {
+        "name": "Jumps"
+      },
+      "calories": {
+        "name": "Calories"
+      },
+      "duration": {
+        "name": "Duration"
+      },
+      "today_jumps": {
+        "name": "Jumps today"
+      },
+      "today_calories": {
+        "name": "Calories today"
+      },
+      "today_duration": {
+        "name": "Duration today"
+      },
+      "today_sessions": {
+        "name": "Sessions today"
+      },
+      "last_session_jumps": {
+        "name": "Last session jumps"
+      },
+      "last_read": {
+        "name": "Last read"
+      },
+      "stored_workouts": {
+        "name": "Stored workouts"
+      },
+      "journal_entries": {
+        "name": "Journal entries"
+      }
     },
     "binary_sensor": {
-      "workout_active": { "name": "Workout active" }
+      "workout_active": {
+        "name": "Workout active"
+      }
+    },
+    "button": {
+      "connect_now": {
+        "name": "Connect now"
+      }
     }
   }
 }
